@@ -1,0 +1,54 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+
+# Build outputs
+dist
+build
+*.tsbuildinfo
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Testing
+coverage
+.nyc_output
+
+# Temporary files
+*.tmp
+*.temp
+.cache
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Uploaded files (user documents - should not be in git)
+uploads/*
+!uploads/.gitkeep
+uploads/originals/*
+uploads/signed/*
+uploads/signatures/*
+
+# Note: .env files are NOT ignored - they will be committed to git
+# If you want to ignore .env, uncomment the line below:
+# .env
+# .env.local
+# .env.*.local
+

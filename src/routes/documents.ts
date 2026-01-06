@@ -433,39 +433,78 @@ router.get(
       const documentId = parseInt(req.params.id);
       const userId = req.user!.userId;
       const userRole = req.user!.role;
-      
-      let query;
-      let params;
-      
-      if (userRole === 'management') {
-        // Management can only download their own documents
-        query = 'SELECT * FROM documents WHERE id = $1 AND uploaded_by = $2';
-        params = [documentId, userId];
-      } else {
-        // Recipients can only download documents assigned to them
-        query = `SELECT d.* FROM documents d
-                 JOIN document_recipients dr ON d.id = dr.document_id
-                 WHERE d.id = $1 AND dr.recipient_id = $2`;
-        params = [documentId, userId];
-      }
-      
-      const result = await pool.query(query, params);
-      
-      if (result.rows.length === 0) {
+
+      console.log('\n📥 Incoming download request:', {
+        documentId,
+        userId,
+        userRole,
+      });
+
+      // First check basic document existence and owner
+      const docCheck = await pool.query(
+        'SELECT * FROM documents WHERE id = $1',
+        [documentId]
+      );
+
+      if (docCheck.rows.length === 0) {
+        console.error(`❌ Document ${documentId} does not exist`);
         return res.status(404).json({ error: 'Document not found' });
       }
+
+      const document = docCheck.rows[0];
+      const docOwner = document.uploaded_by;
+      console.log(`   Document owner: ${docOwner}`);
+
+      // Allow access if user is owner (management uploading the doc)
+      if (docOwner === userId) {
+        console.log(`✅ User ${userId} is the owner, download allowed`);
+      } else {
+        // Otherwise require that the user is an assigned recipient,
+        // regardless of their role (management or recipient).
+        const assignmentCheck = await pool.query(
+          `SELECT dr.* FROM document_recipients dr 
+           WHERE dr.document_id = $1 AND dr.recipient_id = $2`,
+          [documentId, userId]
+        );
+
+        console.log(
+          `   Assignment check for download: ${assignmentCheck.rows.length} assignments found`
+        );
+
+        if (assignmentCheck.rows.length === 0) {
+          console.error(
+            `❌ User ${userId} has no access to document ${documentId} for download`
+          );
+          return res
+            .status(404)
+            .json({ error: 'Document not found or access denied' });
+        }
+
+        console.log(
+          `✅ User ${userId} is assigned as recipient, download allowed`
+        );
+      }
       
-      const document = result.rows[0];
       const filePath = document.signed_file_path || document.original_file_path;
       
       console.log(`📄 Download request for document ${documentId}:`);
-      console.log(`   File path: ${filePath}`);
+      console.log(`   DB file path: ${filePath}`);
       console.log(`   File type: ${document.file_type}`);
       console.log(`   Original filename: ${document.original_filename}`);
       
-      // Resolve absolute path
-      const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(filePath);
-      console.log(`   Absolute path: ${absolutePath}`);
+      // Resolve absolute path in a way that is independent of the current working directory.
+      // Files are stored under UPLOAD_DIR (default "./uploads") relative to the backend root.
+      // When we store paths like "uploads/originals/xxx.pdf" in the DB, we need to resolve
+      // them relative to the backend directory, not the process.cwd().
+      const backendRoot = path.resolve(__dirname, '..', '..'); // .../signbackend
+      console.log(`   __dirname: ${__dirname}`);
+      console.log(`   Backend root (resolved from __dirname): ${backendRoot}`);
+
+      const absolutePath = path.isAbsolute(filePath)
+        ? filePath
+        : path.resolve(backendRoot, filePath);
+
+      console.log(`   Resolved absolute path: ${absolutePath}`);
       
       if (!fs.existsSync(absolutePath)) {
         console.error(`❌ File not found at path: ${absolutePath}`);
@@ -482,20 +521,28 @@ router.get(
         return res.status(404).json({ error: 'File is empty' });
       }
       
-      // Set proper headers for PDF viewing (not download)
+      // Set proper headers for PDF viewing/streaming
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `inline; filename="${document.original_filename}"`);
       res.setHeader('Content-Length', stats.size.toString());
+      res.setHeader('Accept-Ranges', 'bytes');
       
-      // Send file for viewing
-      res.sendFile(absolutePath, (err) => {
-        if (err) {
-          console.error('❌ Error sending file:', err);
-          if (!res.headersSent) {
-            res.status(500).json({ error: 'Failed to send file' });
-          }
+      // Stream the file instead of buffering it all at once.
+      // This works well with Axios `responseType: "blob"` on the frontend
+      // and avoids memory issues with large PDFs.
+      const fileStream = fs.createReadStream(absolutePath);
+
+      fileStream.on('open', () => {
+        console.log(`📄 Streaming file to client: ${absolutePath}`);
+        fileStream.pipe(res);
+      });
+
+      fileStream.on('error', (err) => {
+        console.error('❌ Error reading file stream:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to stream file' });
         } else {
-          console.log(`✅ File sent successfully: ${absolutePath}`);
+          res.end();
         }
       });
     } catch (error) {

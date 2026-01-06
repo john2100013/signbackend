@@ -292,14 +292,34 @@ router.post(
         [documentId]
       );
       
+      // Ensure signed directory exists
+      const signedDir = path.join(UPLOAD_DIR, 'signed');
+      if (!fs.existsSync(signedDir)) {
+        fs.mkdirSync(signedDir, { recursive: true });
+        console.log(`📁 Created signed directory: ${signedDir}`);
+      }
+      
       // Sign the PDF
       const signedFilePath = path.join(UPLOAD_DIR, 'signed', `signed-${documentId}-${Date.now()}.pdf`);
-      await signPDF(
-        document.original_file_path,
-        signedFilePath,
-        allTextFieldsResult.rows,
-        allSignaturesResult.rows
-      );
+      
+      console.log('📝 Starting PDF signing process...');
+      console.log('   Original PDF:', document.original_file_path);
+      console.log('   Output PDF:', signedFilePath);
+      console.log('   Text fields:', allTextFieldsResult.rows.length);
+      console.log('   Signatures:', allSignaturesResult.rows.length);
+      
+      try {
+        await signPDF(
+          document.original_file_path,
+          signedFilePath,
+          allTextFieldsResult.rows,
+          allSignaturesResult.rows
+        );
+        console.log('✅ PDF signing completed successfully');
+      } catch (signError: any) {
+        console.error('❌ PDF signing error:', signError);
+        throw new Error(`Failed to sign PDF: ${signError.message}`);
+      }
       
       // Update recipient status
       await pool.query(
@@ -333,16 +353,28 @@ router.post(
           document.uploader_email,
           document.uploader_name,
           document.title,
-          user.full_name
+          user.full_name,
+          documentId
         );
+        console.log('✅ Notification email sent to uploader');
       } catch (emailError) {
-        console.error('Failed to send notification email:', emailError);
+        console.error('⚠️ Failed to send notification email (document signing still completed):', emailError);
       }
       
-      res.json({ message: 'Document signed successfully', signed_file_path: signedFilePath });
-    } catch (error) {
-      console.error('Submit signature error:', error);
-      res.status(500).json({ error: 'Failed to submit signature' });
+      res.json({ 
+        message: 'Document signed successfully', 
+        signed_file_path: signedFilePath,
+        document_id: documentId,
+        status: newStatus
+      });
+    } catch (error: any) {
+      console.error('❌ Submit signature error:', error);
+      console.error('Error stack:', error.stack);
+      const errorMessage = error.message || 'Failed to submit signature';
+      res.status(500).json({ 
+        error: errorMessage,
+        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
     }
   }
 );

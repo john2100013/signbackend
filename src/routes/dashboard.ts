@@ -60,6 +60,16 @@ router.get(
           [userId]
         );
 
+        const sentBackForSigning = await pool.query(
+          `SELECT COUNT(DISTINCT d.id) as count
+           FROM documents d
+           JOIN document_recipients dr ON d.id = dr.document_id
+           WHERE d.uploaded_by = $1 
+             AND dr.status = 'sent_back_for_signing'
+             AND d.status = 'sent_back_for_signing'`,
+          [userId]
+        );
+
         // Calculate trends (simplified - compare with last month)
         const lastMonth = new Date();
         lastMonth.setMonth(lastMonth.getMonth() - 1);
@@ -98,6 +108,7 @@ router.get(
           draftDocuments: parseInt(draftDocs.rows[0].count),
           waitingConfirmation: parseInt(waitingConfirmation.rows[0].count),
           sentForSigning: parseInt(sentForSigning.rows[0].count),
+          sentBackForSigning: parseInt(sentBackForSigning.rows[0].count),
         });
       } else {
         // Recipient stats - check for any user with assignments (regardless of role)
@@ -116,10 +127,16 @@ router.get(
           [userId, 'signed']
         );
 
+        const sentBackDocs = await pool.query(
+          'SELECT COUNT(*) as count FROM document_recipients WHERE recipient_id = $1 AND status = $2',
+          [userId, 'sent_back_for_signing']
+        );
+
         res.json({
           pendingDocuments: parseInt(pendingDocs.rows[0].count),
           draftDocuments: parseInt(draftDocs.rows[0].count),
           signedDocuments: parseInt(signedDocs.rows[0].count),
+          sentBackForSigning: parseInt(sentBackDocs.rows[0].count),
         });
       }
     } catch (error) {

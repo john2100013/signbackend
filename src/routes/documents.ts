@@ -6,7 +6,7 @@ import pool from '../db/connection';
 import { authenticate, requireRole, AuthRequest } from '../middleware/auth';
 import { auditLog } from '../middleware/audit';
 import { convertWordToPDF, isWordDocument, isPDF } from '../services/documentProcessor';
-import { sendDocumentAssignmentEmail } from '../services/email';
+import { sendDocumentAssignmentEmail, sendDocumentForwardEmail, sendDocumentBackEmail } from '../services/email';
 import { generateRandomPassword, hashPassword } from '../utils/password';
 
 const router = express.Router();
@@ -259,7 +259,7 @@ router.get(
         console.log(`✅ User ${userId} is assigned as recipient`);
         const result = await pool.query(
           `SELECT d.*, u.full_name as uploaded_by_name, 
-                  dr.status as recipient_status, dr.due_date, dr.signed_at
+                  dr.status as recipient_status, dr.due_date, dr.signed_at, dr.revision_note
            FROM documents d
            JOIN users u ON d.uploaded_by = u.id
            JOIN document_recipients dr ON d.id = dr.document_id
@@ -548,6 +548,378 @@ router.get(
     } catch (error) {
       console.error('Download error:', error);
       res.status(500).json({ error: 'Failed to download document' });
+    }
+  }
+);
+
+// Forward document to other users
+router.post(
+  '/:id/forward',
+  authenticate,
+  requireRole(['management']),
+  auditLog('forwarded'),
+  async (req: AuthRequest, res) => {
+    try {
+      const documentId = parseInt(req.params.id);
+      const userId = req.user!.userId;
+      const { userIds, ccEmails, externalEmails } = req.body;
+
+      // Validate input
+      if ((!userIds || userIds.length === 0) && (!externalEmails || externalEmails.length === 0)) {
+        return res.status(400).json({ error: 'At least one recipient is required' });
+      }
+
+      // Verify document belongs to this user
+      const docResult = await pool.query(
+        'SELECT * FROM documents WHERE id = $1 AND uploaded_by = $2',
+        [documentId, userId]
+      );
+
+      if (docResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Document not found or access denied' });
+      }
+
+      const document = docResult.rows[0];
+      const filePath = document.signed_file_path || document.original_file_path;
+      const backendRoot = path.resolve(__dirname, '..', '..');
+      const absoluteFilePath = path.isAbsolute(filePath)
+        ? filePath
+        : path.resolve(backendRoot, filePath);
+
+      if (!fs.existsSync(absoluteFilePath)) {
+        return res.status(404).json({ error: 'Document file not found' });
+      }
+
+      // Get sender info
+      const senderResult = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+      if (senderResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Sender not found' });
+      }
+      const sender = senderResult.rows[0];
+      const results = [];
+
+      // Forward to users with accounts
+      if (userIds && userIds.length > 0) {
+        for (const recipientId of userIds) {
+          try {
+            const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [recipientId]);
+            if (userResult.rows.length > 0) {
+              const recipient = userResult.rows[0];
+              
+              // Send email notification
+              await sendDocumentForwardEmail(
+                recipient.email,
+                recipient.full_name,
+                sender.full_name,
+                document.title,
+                documentId,
+                absoluteFilePath,
+                document.original_filename,
+                false
+              );
+
+              results.push({ userId: recipientId, email: recipient.email, success: true });
+            }
+          } catch (error) {
+            console.error(`Failed to forward to user ${recipientId}:`, error);
+            results.push({ userId: recipientId, success: false, error: String(error) });
+          }
+        }
+      }
+
+      // Forward to CC emails (users with accounts)
+      if (ccEmails && ccEmails.length > 0) {
+        for (const email of ccEmails) {
+          try {
+            const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+            if (userResult.rows.length > 0) {
+              const recipient = userResult.rows[0];
+              
+              await sendDocumentForwardEmail(
+                recipient.email,
+                recipient.full_name,
+                sender.full_name,
+                document.title,
+                documentId,
+                absoluteFilePath,
+                document.original_filename,
+                false
+              );
+
+              results.push({ email, success: true, type: 'cc' });
+            } else {
+              // If user doesn't exist, send as external
+              await sendDocumentForwardEmail(
+                email,
+                email.split('@')[0],
+                sender.full_name,
+                document.title,
+                documentId,
+                absoluteFilePath,
+                document.original_filename,
+                true
+              );
+
+              results.push({ email, success: true, type: 'cc-external' });
+            }
+          } catch (error) {
+            console.error(`Failed to forward to CC ${email}:`, error);
+            results.push({ email, success: false, type: 'cc', error: String(error) });
+          }
+        }
+      }
+
+      // Forward to external emails (users without accounts)
+      if (externalEmails && externalEmails.length > 0) {
+        for (const email of externalEmails) {
+          try {
+            await sendDocumentForwardEmail(
+              email,
+              email.split('@')[0],
+              sender.full_name,
+              document.title,
+              documentId,
+              absoluteFilePath,
+              document.original_filename,
+              true
+            );
+
+            results.push({ email, success: true, type: 'external' });
+          } catch (error) {
+            console.error(`Failed to forward to external ${email}:`, error);
+            results.push({ email, success: false, type: 'external', error: String(error) });
+          }
+        }
+      }
+
+      res.json({
+        message: 'Document forwarded successfully',
+        results,
+      });
+    } catch (error) {
+      console.error('Forward document error:', error);
+      res.status(500).json({ error: 'Failed to forward document' });
+    }
+  }
+);
+
+// Send document back to signer
+router.post(
+  '/:id/send-back',
+  authenticate,
+  requireRole(['management']),
+  auditLog('sent_back'),
+  async (req: AuthRequest, res) => {
+    try {
+      const documentId = parseInt(req.params.id);
+      const userId = req.user!.userId;
+      const { note } = req.body;
+
+      if (!note || !note.trim()) {
+        return res.status(400).json({ error: 'Note is required' });
+      }
+
+      // Verify document belongs to this user
+      const docResult = await pool.query(
+        'SELECT * FROM documents WHERE id = $1 AND uploaded_by = $2',
+        [documentId, userId]
+      );
+
+      if (docResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Document not found or access denied' });
+      }
+
+      const document = docResult.rows[0];
+
+      // Get the signer (recipient who signed)
+      const signerResult = await pool.query(
+        `SELECT u.*, dr.status 
+         FROM document_recipients dr
+         JOIN users u ON dr.recipient_id = u.id
+         WHERE dr.document_id = $1 AND dr.status = 'signed'
+         ORDER BY dr.signed_at DESC
+         LIMIT 1`,
+        [documentId]
+      );
+
+      if (signerResult.rows.length === 0) {
+        return res.status(404).json({ error: 'No signer found for this document' });
+      }
+
+      const signer = signerResult.rows[0];
+      
+      // Get sender info
+      const senderResult = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+      if (senderResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Sender not found' });
+      }
+      const sender = senderResult.rows[0];
+
+      // Reset recipient status to sent_back_for_signing and store the note
+      await pool.query(
+        `UPDATE document_recipients 
+         SET status = 'sent_back_for_signing', signed_at = NULL, revision_note = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE document_id = $1 AND recipient_id = $2`,
+        [documentId, signer.id, note.trim()]
+      );
+
+      // Update document status
+      await pool.query(
+        'UPDATE documents SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        ['sent_back_for_signing', documentId]
+      );
+
+      // Send email notification
+      await sendDocumentBackEmail(
+        signer.email,
+        signer.full_name,
+        sender.full_name,
+        document.title,
+        note,
+        documentId
+      );
+
+      res.json({ message: 'Document sent back to signer successfully' });
+    } catch (error) {
+      console.error('Send back document error:', error);
+      res.status(500).json({ error: 'Failed to send document back' });
+    }
+  }
+);
+
+// Get documents sent back for signing
+// For recipients: documents sent back to them
+// For management: documents they sent back to recipients
+router.get(
+  '/sent-back-for-signing',
+  authenticate,
+  async (req: AuthRequest, res) => {
+    try {
+      const userId = req.user!.userId;
+      const userRole = req.user!.role;
+      
+      // Check if revision_note column exists
+      const columnCheck = await pool.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'document_recipients' 
+        AND column_name = 'revision_note'
+      `);
+      const hasRevisionNote = columnCheck.rows.length > 0;
+
+      if (userRole === 'management') {
+        // For management: Get documents they sent back
+        const revisionNoteSelect = hasRevisionNote ? 'dr.revision_note,' : 'NULL as revision_note,';
+        const result = await pool.query(
+          `SELECT 
+            d.*,
+            dr.status as recipient_status,
+            ${revisionNoteSelect}
+            dr.updated_at as sent_back_at,
+            u.full_name as recipient_name,
+            u.email as recipient_email,
+            dr.recipient_id
+           FROM documents d
+           JOIN document_recipients dr ON d.id = dr.document_id
+           JOIN users u ON dr.recipient_id = u.id
+           WHERE d.uploaded_by = $1 
+             AND dr.status = 'sent_back_for_signing'
+             AND d.status = 'sent_back_for_signing'
+           ORDER BY dr.updated_at DESC`,
+          [userId]
+        );
+        
+        res.json({ documents: result.rows });
+      } else {
+        // For recipients: Get documents sent back to them
+        const revisionNoteSelect = hasRevisionNote ? 'dr.revision_note,' : 'NULL as revision_note,';
+        const result = await pool.query(
+          `SELECT 
+            d.*,
+            dr.status as recipient_status,
+            ${revisionNoteSelect}
+            dr.updated_at as sent_back_at,
+            u.full_name as sender_name,
+            u.email as sender_email
+           FROM documents d
+           JOIN document_recipients dr ON d.id = dr.document_id
+           JOIN users u ON d.uploaded_by = u.id
+           WHERE dr.recipient_id = $1 
+             AND dr.status = 'sent_back_for_signing'
+             AND d.status = 'sent_back_for_signing'
+           ORDER BY dr.updated_at DESC`,
+          [userId]
+        );
+        
+        res.json({ documents: result.rows });
+      }
+    } catch (error: any) {
+      console.error('Get sent back for signing error:', error);
+      console.error('Error details:', {
+        message: error.message,
+        code: error.code,
+        detail: error.detail,
+        stack: error.stack
+      });
+      res.status(500).json({ 
+        error: 'Failed to get documents sent back for signing',
+        details: error.message 
+      });
+    }
+  }
+);
+
+// Get documents sent back to me (for management users who are also recipients)
+router.get(
+  '/sent-back-to-me',
+  authenticate,
+  async (req: AuthRequest, res) => {
+    try {
+      const userId = req.user!.userId;
+      
+      // Check if revision_note column exists
+      const columnCheck = await pool.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'document_recipients' 
+        AND column_name = 'revision_note'
+      `);
+      const hasRevisionNote = columnCheck.rows.length > 0;
+
+      // Get documents where user is a recipient (not the owner) and status is sent_back_for_signing
+      const revisionNoteSelect = hasRevisionNote ? 'dr.revision_note,' : 'NULL as revision_note,';
+      const result = await pool.query(
+        `SELECT 
+          d.*,
+          dr.status as recipient_status,
+          ${revisionNoteSelect}
+          dr.updated_at as sent_back_at,
+          u.full_name as sender_name,
+          u.email as sender_email
+         FROM documents d
+         JOIN document_recipients dr ON d.id = dr.document_id
+         JOIN users u ON d.uploaded_by = u.id
+         WHERE dr.recipient_id = $1 
+           AND d.uploaded_by != $1
+           AND dr.status = 'sent_back_for_signing'
+           AND d.status = 'sent_back_for_signing'
+         ORDER BY dr.updated_at DESC`,
+        [userId]
+      );
+      
+      res.json({ documents: result.rows });
+    } catch (error: any) {
+      console.error('Get sent back to me error:', error);
+      console.error('Error details:', {
+        message: error.message,
+        code: error.code,
+        detail: error.detail,
+        stack: error.stack
+      });
+      res.status(500).json({ 
+        error: 'Failed to get documents sent back to me',
+        details: error.message 
+      });
     }
   }
 );
